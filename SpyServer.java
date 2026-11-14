@@ -1,5 +1,5 @@
 /* =====================================================================
- *  SpyServer.java  -  "Brra Al-Salfa" (برا السالفة) Game Server
+ *  SpyServer.java  -  "Al-Dakheel" (الدخيل) Game Server
  *  CpE 458 - Network Programming - Dr. Mohamad Awad
  * ---------------------------------------------------------------------
  *  BIG PICTURE
@@ -10,10 +10,32 @@
  *   5. Every line starts with a prefix (CHAT:, VOTE:, ROLE: ...)
  *      so the server and the client know what kind of message it is.
  *
- *  THE 3 CLASSES IN THIS FILE
+ *  THE 4 CLASSES IN THIS FILE
  *   SpyServer     -> the window + the game rules (one object)
- *   ClientHandler -> one thread per connected player
+ *   ClientHandler -> one thread per connected player (or host screen)
  *   GameTimer     -> a thread that counts down the seconds
+ *   VoiceRelay    -> a thread that relays push-to-talk voice (UDP)
+ *
+ *  CATEGORY FILES
+ *   The words come from the "categories" folder next to the server:
+ *   one .txt file per category, the file name is the category name.
+ *   Inside, one word per line, optionally with its Arabic after a "|":
+ *       #ar: أكل
+ *       Machboos | مجبوس
+ *       Pizza
+ *   Lines starting with # are comments. If the folder is missing, the
+ *   built-in word bank is used.
+ *
+ *  HOST SCREEN
+ *   A client that sends "#HOST" as its first line is a big shared
+ *   display (TV / projector). It gets every broadcast but is not a
+ *   player and never receives a ROLE.
+ *
+ *  THE HOST (who picks the file and opens the case)
+ *   - if a host screen is connected, the host screen is the host
+ *   - otherwise the FIRST player in the Vector is the host
+ *   If the host leaves, the next one automatically becomes host.
+ *   PICK and START_GAME from anybody else are refused.
  *
  *  SECTION MAP (search for the tag, e.g. "[S7]")
  *   [S1] Settings, word bank, XP points     [S8]  Voting
@@ -30,12 +52,21 @@
  *   START_GAME       "Start Game" was clicked
  *   VOTE:<name>      vote for <name>
  *   GUESS:<word>     the caught outsider guesses the word (bonus)
+ *   PICK:<category>  choose the category for the next round (or RANDOM)
+ *                    (PICK and START_GAME: only the host, also the host screen)
  *
  *  MESSAGES  (Server -> Client)
+ *   NAME_TAKEN              another player already uses this nickname
+ *                           (the server then closes the connection)
  *   CHAT:<name>: <text>     chat line to show
  *   INFO:<text>             announcement from the server (bonus)
  *   PLAYERS:<n1>,<n2>,...   updated list of players (for the drop-down)
- *   ROLE:<text>             the secret word, or "You are Brra Al-Salfa!"
+ *   ROLE:<text>             the secret word, or "You are Al-Dakheel!"
+ *   WORD_AR:<text>          the secret word in Arabic (sent before ROLE, if known)
+ *   CATEGORIES:<n>|<ar>,... the category files players can choose from
+ *   PICKED:<category>|<who> the category chosen for the next round
+ *   HOST:<name>             who the host is ("#SCREEN" = the host screen)
+ *   VOTED:<name>            <name> has voted (not for who)
  *   CATEGORY:<text>         the word's category, e.g. Food (bonus)
  *   PHASE:<name>            LOBBY / DISCUSS / VOTE / GUESS (bonus)
  *   TIMER:<seconds>         seconds left in this phase (bonus)
@@ -45,6 +76,11 @@
  *   XP:<points>,<WIN/LOSE>  points this player earned this round (bonus)
  *   PROFILE:<rank>,<level>,<games>,<wins>,<xp>   saved stats (bonus)
  *   SCORES:<line1>,<line2>,...                   leaderboard (bonus)
+ *
+ *  VOICE  (UDP port 1203, see VoiceRelay)
+ *   every packet: [type byte][name (writeUTF)][audio bytes]
+ *   type 1 = HELLO (register this address), 2 = AUDIO, 3 = STOP talking
+ *   The server sends AUDIO/STOP to everyone else with the speaker's name.
  * ===================================================================== */
 
 import java.awt.*;
@@ -60,6 +96,7 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	// [S1] SETTINGS, WORD BANK AND XP POINTS
 	// =================================================================
 	private static final int PORT = 1202;            // port the server listens on
+	static final int VOICE_PORT = 1203;              // UDP port for push-to-talk voice
 	private static final int MIN_PLAYERS = 2;        // need at least 2 players to start
 
 	// how long each phase lasts (in seconds)
@@ -67,7 +104,11 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	private static final int VOTE_TIME = 30;         // voting
 	private static final int GUESS_TIME = 20;        // outsider's last chance guess
 
-	// word bank: WORDS[i] belongs to the category CATEGORIES[i]
+	// folder with one .txt file per category
+	private static final String CATEGORY_FOLDER = "categories";
+
+	// built-in word bank, used only if the categories folder is missing
+	// WORDS[i] belongs to the category CATEGORIES[i]
 	private static final String[] WORDS = {
 		"Shawarma", "Machboos", "Falafel", "Kunafa", "Pizza", "Karak Tea",
 		"Kuwait Towers", "Airport", "Hospital", "University", "Cinema", "Beach",
@@ -94,7 +135,7 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	private static final int NAME_SIZE = 15;                    // 15 chars per name
 	private static final int REC_SIZE = 42;                     // 30 (name) + 4 + 4 + 4 bytes
 
-	// colors of the server window (same theme as the client)
+	// colors of the server window
 	private static final Color BG = new Color(14, 20, 38);         // deep navy
 	private static final Color PANEL = new Color(24, 33, 58);      // lighter navy
 	private static final Color GOLD = new Color(212, 175, 55);     // gold accent
@@ -119,7 +160,19 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	private int roundNumber = 0;
 	private String secretWord = "";
 	private String category = "";
-	private ClientHandler outsider = null;     // the player who is Brra Al-Salfa
+	private ClientHandler outsider = null;     // the player who is Al-Dakheel
+	private String secretWordArabic = "";      // "" if the file has no Arabic for it
+
+	// the category files: category name -> list of {English, Arabic} words
+	private LinkedHashMap<String, ArrayList<String[]>> bank = new LinkedHashMap<String, ArrayList<String[]>>();
+	private HashMap<String, String> categoryArabic = new HashMap<String, String>();
+	private String pickedCategory = "RANDOM";  // chosen in the lobby
+
+	// host screens (TV / projector): they see the game but don't play
+	private Vector<ClientHandler> displays = new Vector<ClientHandler>();
+
+	// relays push-to-talk voice between the players
+	private VoiceRelay voice = new VoiceRelay(this);
 
 	// =================================================================
 	// [S3] MAIN + SERVER WINDOW
@@ -129,7 +182,7 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	}
 
 	public SpyServer() {
-		setTitle("Brra Al-Salfa - Server");
+		setTitle("Al-Dakheel - Server");
 		setSize(650, 520);
 		setLayout(new BorderLayout());
 		getContentPane().setBackground(BG);
@@ -138,7 +191,7 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 		topPanel = new JPanel(new GridLayout(3, 1));
 		topPanel.setBackground(PANEL);
 		topPanel.setBorder(BorderFactory.createEmptyBorder(10, 15, 10, 15));
-		titleLabel = new JLabel("BRRA AL-SALFA  |  GAME SERVER");
+		titleLabel = new JLabel("AL-DAKHEEL  |  GAME SERVER");
 		titleLabel.setFont(new Font("Segoe UI", Font.BOLD, 20));
 		titleLabel.setForeground(GOLD);
 		topPanel.add(titleLabel);
@@ -239,6 +292,12 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 			// create server socket
 			serverSocket = new ServerSocket(PORT);
 			showMessage("Server started. Waiting for players...");
+			synchronized (this) {
+				loadCategories();
+			}
+			// start the voice relay in its own thread
+			Thread voiceThread = new Thread(voice);
+			voiceThread.start();
 			updateStatus();
 
 			do {
@@ -284,6 +343,10 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 		for (int i = 0; i < clients.size(); i++) {
 			clients.elementAt(i).send(message);
 		}
+		// host screens see everything that is broadcast
+		for (int i = 0; i < displays.size(); i++) {
+			displays.elementAt(i).send(message);
+		}
 	}
 
 	// sends "PLAYERS:n1,n2,n3" to everyone (used for the voting drop-down)
@@ -298,12 +361,56 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 		broadcast(list);
 	}
 
-	// called when a player sent their nickname
-	public synchronized void addPlayer(ClientHandler player) {
+	// who is the host? the host screen if there is one, else the first player
+	private String hostName() {
+		if (displays.size() > 0) {
+			return "#SCREEN";
+		}
+		if (clients.size() > 0) {
+			return clients.firstElement().name;
+		}
+		return "";
+	}
+
+	// is this client the host? (only the host may pick the file / start)
+	private boolean isHost(ClientHandler c) {
+		if (displays.size() > 0) {
+			return c.isDisplay;
+		}
+		return clients.size() > 0 && clients.firstElement() == c;
+	}
+
+	// tells everyone who the host is: "HOST:Nouri" or "HOST:#SCREEN"
+	public synchronized void sendHost() {
+		broadcast("HOST:" + hostName());
+	}
+
+	// is this nickname already used by a connected player? (not case sensitive,
+	// so "Nouri" and "nouri" count as the same name)
+	private boolean nameInUse(String name) {
+		for (int i = 0; i < clients.size(); i++) {
+			if (clients.elementAt(i).name.equalsIgnoreCase(name)) {
+				return true;
+			}
+		}
+		return false;
+	}
+
+	// called when a player sent their nickname.
+	// returns false (and adds nobody) if the nickname is already taken.
+	// The check and the add are in the SAME synchronized method, so two
+	// players with the same name can't both get in at the same moment.
+	public synchronized boolean addPlayer(ClientHandler player) {
+		// names starting with # are reserved (#HOST is the host screen)
+		if (nameInUse(player.name) || player.name.startsWith("#") || player.name.length() == 0) {
+			showMessage("Refused a second player called \"" + player.name + "\".");
+			return false;
+		}
 		clients.add(player);                                   // add to the Vector
 		showMessage(">> " + player.name + " joined the game.");
 		broadcast("INFO:" + player.name + " joined the game!");
 		sendPlayerList();
+		sendHost();
 
 		// load (or create) the saved profile of this player
 		boolean returning = loadProfile(player);
@@ -311,10 +418,12 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 			player.send("INFO:Welcome back, " + player.name + "! You are a "
 					+ getRank(player.xp) + " with " + player.wins + " wins.");
 		} else {
-			player.send("INFO:Welcome to Brra Al-Salfa, " + player.name + "! A new profile was created for you.");
+			player.send("INFO:Welcome to Al-Dakheel, " + player.name + "! A new profile was created for you.");
 		}
 		sendProfile(player);
 		sendLeaderboard();
+		player.send(categoriesMessage());
+		player.send("PICKED:" + pickedCategory + "|");
 
 		// if a round is already running, this player waits for the next one
 		if (gameRunning) {
@@ -322,17 +431,51 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 			player.send("PHASE:" + phase);
 		}
 		updateStatus();
+		return true;
+	}
+
+	// a host screen joined: send it everything it needs to draw the game
+	public synchronized void addDisplay(ClientHandler display) {
+		displays.add(display);
+		showMessage(">> A host screen connected. It is now the host.");
+		sendPlayerList();
+		sendHost();
+		display.send(categoriesMessage());
+		display.send("PICKED:" + pickedCategory + "|");
+		sendLeaderboard();
+		display.send("PHASE:" + phase);
+		if (gameRunning) {
+			display.send("CATEGORY:" + category);
+		}
+	}
+
+	// is this the exact name of a connected player? (used by the voice relay)
+	public synchronized boolean isPlayerName(String name) {
+		for (int i = 0; i < clients.size(); i++) {
+			if (clients.elementAt(i).name.equals(name)) {
+				return true;
+			}
+		}
+		return false;
 	}
 
 	// called when a player closes the window or loses connection
 	public synchronized void removePlayer(ClientHandler player) {
+		if (displays.contains(player)) {
+			displays.remove(player);
+			showMessage("<< A host screen disconnected.");
+			sendHost();                     // a player becomes host again
+			return;
+		}
 		if (!clients.contains(player)) {
 			return;                         // never finished joining
 		}
 		clients.remove(player);             // remove from the Vector
+		voice.forget(player.name);          // stop relaying their voice
 		showMessage("<< " + player.name + " left the game.");
 		broadcast("INFO:" + player.name + " has left the game.");
 		sendPlayerList();
+		sendHost();                         // if the host left, the next player is host
 		sendLeaderboard();
 
 		// what happens to the round when someone leaves?
@@ -355,7 +498,8 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	public synchronized void chat(ClientHandler sender, String text) {
 		// WORD FILTER (bonus): an insider is not allowed to type the secret word
 		if (gameRunning && sender.inRound && sender != outsider
-				&& text.toLowerCase().contains(secretWord.toLowerCase())) {
+				&& (text.toLowerCase().contains(secretWord.toLowerCase())
+					|| (secretWordArabic.length() > 0 && text.contains(secretWordArabic)))) {
 			sender.send("INFO:Careful! You cannot say the secret word. Your message was blocked.");
 			showMessage("[blocked] " + sender.name + ": " + text);
 			return;
@@ -391,6 +535,10 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	// [S7] START GAME: PICK THE WORD AND THE OUTSIDER
 	// =================================================================
 	public synchronized void startGame(ClientHandler starter) {
+		if (!isHost(starter)) {
+			starter.send("INFO:Only the host can open the case.");
+			return;
+		}
 		if (gameRunning) {
 			starter.send("INFO:A round is already running!");
 			return;
@@ -400,12 +548,24 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 			return;
 		}
 
-		// a. pick a random secret word from the word bank
-		int wordIndex = (int) (Math.random() * WORDS.length);
-		secretWord = WORDS[wordIndex];
-		category = CATEGORIES[wordIndex];
+		// a. read the category files again (the host may have added a file)
+		loadCategories();
+		broadcast(categoriesMessage());
 
-		// b. randomly choose ONE player to be the outsider
+		// b. the chosen category, or a random one
+		if (pickedCategory.equals("RANDOM") || !bank.containsKey(pickedCategory)) {
+			ArrayList<String> names = new ArrayList<String>(bank.keySet());
+			category = names.get((int) (Math.random() * names.size()));
+		} else {
+			category = pickedCategory;
+		}
+		// a random word from that category's file
+		ArrayList<String[]> words = bank.get(category);
+		String[] chosen = words.get((int) (Math.random() * words.size()));
+		secretWord = chosen[0];
+		secretWordArabic = chosen[1];
+
+		// c. randomly choose ONE player to be the outsider
 		int outsiderIndex = (int) (Math.random() * clients.size());
 		outsider = clients.elementAt(outsiderIndex);
 
@@ -417,14 +577,17 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 		showMessage("Secret word: " + secretWord + "   (Category: " + category + ")");
 		showMessage("Outsider: " + outsider.name);
 
-		// c. send the roles: the word to everyone except the outsider
+		// d. send the roles: the word to everyone except the outsider
 		for (int i = 0; i < clients.size(); i++) {
 			ClientHandler p = clients.elementAt(i);
 			p.inRound = true;              // this player is playing this round
 			p.votedFor = null;             // nobody has voted yet
 			if (p == outsider) {
-				p.send("ROLE:You are Brra Al-Salfa!");
+				p.send("ROLE:You are Al-Dakheel!");
 			} else {
+				if (secretWordArabic.length() > 0) {
+					p.send("WORD_AR:" + secretWordArabic);   // before ROLE, so the card has it
+				}
 				p.send("ROLE:The secret word is: " + secretWord);
 			}
 			p.send("CATEGORY:" + category);   // everyone (even the outsider) gets the category
@@ -439,6 +602,106 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 		GameTimer timer = new GameTimer(this, DISCUSS_TIME, "DISCUSS", roundNumber);
 		timer.start();
 		updateStatus();
+	}
+
+	// a player picked the category for the next round (or RANDOM)
+	public synchronized void pickCategory(ClientHandler player, String name) {
+		if (!isHost(player)) {
+			player.send("INFO:Only the host can choose the file.");
+			return;
+		}
+		if (gameRunning) {
+			player.send("INFO:You can change the category after this round.");
+			return;
+		}
+		if (!name.equals("RANDOM") && !bank.containsKey(name)) {
+			player.send("INFO:There is no category called " + name + ".");
+			return;
+		}
+		pickedCategory = name;
+		showMessage(player.name + " picked the category: " + name);
+		broadcast("PICKED:" + name + "|" + player.name);
+	}
+
+	// "CATEGORIES:Food|أكل,Place|مكان,..."
+	private String categoriesMessage() {
+		String message = "CATEGORIES:";
+		int i = 0;
+		for (String name : bank.keySet()) {
+			String arabic = categoryArabic.get(name);
+			message = message + name + "|" + (arabic == null ? "" : arabic);
+			if (i < bank.size() - 1) {
+				message = message + ",";
+			}
+			i++;
+		}
+		return message;
+	}
+
+	// reads every .txt file in the categories folder (see the top of this file)
+	private void loadCategories() {
+		LinkedHashMap<String, ArrayList<String[]>> newBank = new LinkedHashMap<String, ArrayList<String[]>>();
+		HashMap<String, String> newArabic = new HashMap<String, String>();
+		File[] files = new File(CATEGORY_FOLDER).listFiles();
+		if (files != null) {
+			Arrays.sort(files);                       // alphabetical order
+			for (int f = 0; f < files.length; f++) {
+				String fileName = files[f].getName();
+				if (!fileName.toLowerCase().endsWith(".txt")) {
+					continue;
+				}
+				// the file name is the category name (no , or | : they would break the messages)
+				String name = fileName.substring(0, fileName.length() - 4).replace(",", " ").replace("|", " ").trim();
+				ArrayList<String[]> words = new ArrayList<String[]>();
+				try {
+					Scanner in = new Scanner(files[f], "UTF-8");
+					while (in.hasNextLine()) {
+						String line = in.nextLine().trim();
+						if (line.length() == 0) {
+							continue;
+						}
+						if (line.startsWith("#")) {
+							if (line.toLowerCase().startsWith("#ar:")) {
+								newArabic.put(name, line.substring(4).trim());   // Arabic name of the category
+							}
+							continue;                         // a comment
+						}
+						String[] parts = line.split("\\|");
+						String english = parts[0].trim();
+						String arabic = parts.length > 1 ? parts[1].trim() : "";
+						if (english.length() > 0) {
+							words.add(new String[] { english, arabic });
+						}
+					}
+					in.close();
+				} catch (IOException ioEx) {
+					showMessage("Could not read " + CATEGORY_FOLDER + "/" + fileName);
+				}
+				if (words.size() > 0) {
+					newBank.put(name, words);
+				}
+			}
+		}
+
+		if (newBank.isEmpty()) {
+			// no files: use the built-in word bank
+			for (int i = 0; i < WORDS.length; i++) {
+				if (!newBank.containsKey(CATEGORIES[i])) {
+					newBank.put(CATEGORIES[i], new ArrayList<String[]>());
+				}
+				newBank.get(CATEGORIES[i]).add(new String[] { WORDS[i], "" });
+			}
+			if (bank.isEmpty()) {
+				showMessage("No files in " + CATEGORY_FOLDER + "/ - using the built-in words.");
+			}
+		} else if (!newBank.keySet().equals(bank.keySet())) {
+			showMessage("Loaded " + newBank.size() + " categories from " + CATEGORY_FOLDER + "/: " + newBank.keySet());
+		}
+		bank = newBank;
+		categoryArabic = newArabic;
+		if (!pickedCategory.equals("RANDOM") && !bank.containsKey(pickedCategory)) {
+			pickedCategory = "RANDOM";             // that file was removed
+		}
 	}
 
 	// QUESTION ORDER (bonus): starting from a random player, each one asks the next
@@ -483,7 +746,7 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	private void openVoting() {
 		phase = "VOTE";
 		broadcast("PHASE:VOTE");
-		broadcast("INFO:Time is up! Vote for the player you think is Brra Al-Salfa. ("
+		broadcast("INFO:Time is up! Vote for the player you think is Al-Dakheel. ("
 				+ VOTE_TIME + " seconds)");
 		broadcast("VOTES:0/" + countInRound());
 		GameTimer timer = new GameTimer(this, VOTE_TIME, "VOTE", roundNumber);
@@ -504,6 +767,7 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 		voter.votedFor = name;
 		showMessage(voter.name + " voted for " + name);
 		broadcast("INFO:" + voter.name + " has voted.");          // we do not say for who!
+		broadcast("VOTED:" + voter.name);
 		broadcast("VOTES:" + countVotesCast() + "/" + countInRound());
 
 		// once all players have voted, count the votes
@@ -591,14 +855,17 @@ public class SpyServer extends JFrame implements ActionListener, Runnable {
 	private void finishRound(boolean outsiderWins, boolean stolen, String reason) {
 		String winner;
 		if (outsiderWins) {
-			winner = "Brra Al-Salfa (" + outsider.name + ")";
+			winner = "Al-Dakheel (" + outsider.name + ")";
 		} else {
 			winner = "The players";
 		}
 
 		// broadcast the result: who the outsider was, the word, and who won
-		String result = "Outsider: " + outsider.name + "  |  Word: " + secretWord
-				+ "  |  Winner: " + winner + "  |  " + reason;
+		String result = "Outsider: " + outsider.name + "  |  Word: " + secretWord;
+		if (secretWordArabic.length() > 0) {
+			result = result + "  |  WordAr: " + secretWordArabic;   // so the outsider sees it in Arabic too
+		}
+		result = result + "  |  Winner: " + winner + "  |  " + reason;
 		broadcast("RESULT:" + result);
 		showMessage("RESULT -> " + result);
 
@@ -861,6 +1128,7 @@ class ClientHandler implements Runnable {
 	// information about this player
 	// (not private, so the SpyServer class in this file can read/change them)
 	String name = "";
+	boolean isDisplay = false;    // true = host screen, not a player
 	boolean inRound = false;      // is this player in the current round?
 	String votedFor = null;       // who this player voted for (null = not yet)
 	int sessionPoints = 0;        // points since joining (leaderboard)
@@ -890,7 +1158,27 @@ class ClientHandler implements Runnable {
 		try {
 			// the FIRST message from a client is the nickname
 			name = input.nextLine().trim();
-			server.addPlayer(this);
+
+			if (name.equals("#HOST")) {
+				// a host screen: it watches, and (as the host) it may
+				// pick the file and open the case
+				isDisplay = true;
+				server.addDisplay(this);
+				do {
+					received = input.nextLine();
+					if (received.equals("START_GAME")) {
+						server.startGame(this);
+					} else if (received.startsWith("PICK:")) {
+						server.pickCategory(this, received.substring(5));
+					}
+				} while (true);
+			}
+
+			// a second player with the same name is refused
+			if (!server.addPlayer(this)) {
+				send("NAME_TAKEN");
+				return;                      // "finally" below closes the socket
+			}
 
 			do {
 				// receive the next message from this player
@@ -905,6 +1193,8 @@ class ClientHandler implements Runnable {
 					server.vote(this, received.substring(5));        // name after "VOTE:"
 				} else if (received.startsWith("GUESS:")) {
 					server.guess(this, received.substring(6));       // word after "GUESS:"
+				} else if (received.startsWith("PICK:")) {
+					server.pickCategory(this, received.substring(5)); // category after "PICK:"
 				}
 			} while (true);
 		} catch (Exception ex) {
@@ -955,5 +1245,109 @@ class GameTimer extends Thread {
 		} catch (InterruptedException e) {
 			// the thread was interrupted, nothing to do
 		}
+	}
+}
+
+// =====================================================================
+// VoiceRelay: push-to-talk voice over UDP (DatagramSocket)
+//  Players send small packets of microphone sound to the server, and the
+//  server sends each packet to every OTHER player. UDP is used because a
+//  late sound packet is useless: it is better to skip it than to wait.
+//
+//  packet = [type byte][name (writeUTF)][audio bytes]
+//    HELLO (1): "this address belongs to <name>"  (must be a real player)
+//    AUDIO (2): sound from the player at this address
+//    STOP  (3): the player let go of the talk button
+// =====================================================================
+class VoiceRelay implements Runnable {
+
+	static final byte HELLO = 1, AUDIO = 2, STOP = 3;
+
+	private SpyServer server;
+	private DatagramSocket socket;
+	// which address belongs to which player
+	private HashMap<SocketAddress, String> speakers = new HashMap<SocketAddress, String>();
+
+	public VoiceRelay(SpyServer theServer) {
+		server = theServer;
+	}
+
+	public void run() {
+		try {
+			socket = new DatagramSocket(SpyServer.VOICE_PORT);
+			server.showMessage("Voice relay started on UDP port " + SpyServer.VOICE_PORT + ".");
+			byte[] buffer = new byte[4096];
+			do {
+				DatagramPacket packet = new DatagramPacket(buffer, buffer.length);
+				socket.receive(packet);
+				handle(packet);
+			} while (true);
+		} catch (IOException ioEx) {
+			server.showMessage("Voice relay stopped: " + ioEx.getMessage());
+		}
+	}
+
+	private void handle(DatagramPacket packet) {
+		try {
+			DataInputStream in = new DataInputStream(
+					new ByteArrayInputStream(packet.getData(), 0, packet.getLength()));
+			byte type = in.readByte();
+			String name = in.readUTF();
+			SocketAddress from = packet.getSocketAddress();
+
+			if (type == HELLO) {
+				// only a connected player may register (no strangers on the line)
+				if (server.isPlayerName(name)) {
+					register(from, name);
+				}
+				return;
+			}
+
+			// AUDIO or STOP: use the REGISTERED name, not the one in the packet
+			String speaker = nameOf(from);
+			if (speaker == null) {
+				return;
+			}
+			byte[] audio = new byte[in.available()];
+			in.readFully(audio);
+
+			ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+			DataOutputStream out = new DataOutputStream(bytes);
+			out.writeByte(type);
+			out.writeUTF(speaker);
+			out.write(audio);
+			byte[] data = bytes.toByteArray();
+
+			// send it to everyone except the speaker
+			ArrayList<SocketAddress> others = othersThan(from);
+			for (int i = 0; i < others.size(); i++) {
+				socket.send(new DatagramPacket(data, data.length, others.get(i)));
+			}
+		} catch (IOException ioEx) {
+			// a broken packet: ignore it
+		}
+	}
+
+	private synchronized void register(SocketAddress address, String name) {
+		speakers.put(address, name);
+	}
+
+	private synchronized String nameOf(SocketAddress address) {
+		return speakers.get(address);
+	}
+
+	private synchronized ArrayList<SocketAddress> othersThan(SocketAddress address) {
+		ArrayList<SocketAddress> list = new ArrayList<SocketAddress>();
+		for (SocketAddress a : speakers.keySet()) {
+			if (!a.equals(address)) {
+				list.add(a);
+			}
+		}
+		return list;
+	}
+
+	// a player left: forget their address
+	public synchronized void forget(String name) {
+		speakers.values().removeAll(Collections.singleton(name));
 	}
 }

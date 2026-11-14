@@ -1,0 +1,15 @@
+# Category file for Al-Dakheel. One word per line: English | Arabic
+# Lines starting with # are comments. The file name is the category name.
+#ar: أكل
+Shawarma | شاورما
+Machboos | مجبوس
+Falafel | فلافل
+Kunafa | كنافة
+Pizza | بيتزا
+Karak Tea | شاي كرك
+Harees | هريس
+Mutabbaq | مطبق
+Burger | برغر
+Sushi | سوشي
+Luqaimat | لقيمات
+Biryani | برياني
