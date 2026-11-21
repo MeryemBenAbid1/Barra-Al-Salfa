@@ -1,0 +1,11 @@
+#ar: رياضة
+Football | كورة
+Swimming | سباحة
+Chess | شطرنج
+Bowling | بولينغ
+Fishing | حداق
+Camping | كشتة
+Karaoke | كاريوكي
+Video Games | ألعاب فيديو
+Shopping | تسوق
+Diving | غوص

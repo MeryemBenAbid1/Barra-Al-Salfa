@@ -1,0 +1,13 @@
+#ar: أماكن
+Kuwait Towers | أبراج الكويت
+Airport | مطار
+Hospital | مستشفى
+University | جامعة
+Cinema | سينما
+Beach | بحر
+The Avenues | الأفنيوز
+Souq Al-Mubarakiya | سوق المباركية
+Gym | نادي رياضي
+Cooperative Society | جمعية
+Chalet | شاليه
+Mosque | مسجد
